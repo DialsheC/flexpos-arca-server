@@ -1,0 +1,20 @@
+{
+  "name": "flexpos-arca-server",
+  "version": "1.0.0",
+  "description": "Microservicio de facturación electrónica ARCA/AFIP para FlexPOS",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --env-file=.env --watch index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@arcasdk/core": "^0.3.5",
+    "@supabase/supabase-js": "^2.45.0",
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  }
+}
