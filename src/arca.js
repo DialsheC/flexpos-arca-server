@@ -7,6 +7,13 @@
 
 import { createClient } from '@supabase/supabase-js'
 import { Arca } from '@arcasdk/core'
+import ws from 'ws'
+
+// Node < 22 no trae WebSocket nativo. El cliente de Supabase lo necesita al
+// inicializarse (aunque no usemos tiempo real). Se lo damos vía el global.
+if (!globalThis.WebSocket) {
+  globalThis.WebSocket = ws
+}
 
 const SUPABASE_URL = process.env.SUPABASE_URL
 const ANON_KEY = process.env.SUPABASE_ANON_KEY
@@ -18,7 +25,7 @@ export async function prepararArca(authHeader, tenantId) {
   // 1) Validar que el usuario sea miembro del tenant (RLS filtra por usuario)
   const supabaseUser = createClient(SUPABASE_URL, ANON_KEY, {
     global: { headers: { Authorization: authHeader || '' } },
-    realtime: { params: {} },
+    realtime: { transport: ws },
     auth: { persistSession: false, autoRefreshToken: false },
   })
   const { data: membership, error: memErr } = await supabaseUser
@@ -32,6 +39,7 @@ export async function prepararArca(authHeader, tenantId) {
 
   // 2) Cliente admin (service_role) para leer config y certificado
   const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
+    realtime: { transport: ws },
     auth: { persistSession: false, autoRefreshToken: false },
   })
 
