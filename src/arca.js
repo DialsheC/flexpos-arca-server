@@ -18,6 +18,8 @@ export async function prepararArca(authHeader, tenantId) {
   // 1) Validar que el usuario sea miembro del tenant (RLS filtra por usuario)
   const supabaseUser = createClient(SUPABASE_URL, ANON_KEY, {
     global: { headers: { Authorization: authHeader || '' } },
+    realtime: { params: {} },
+    auth: { persistSession: false, autoRefreshToken: false },
   })
   const { data: membership, error: memErr } = await supabaseUser
     .from('tenant_users')
@@ -29,7 +31,9 @@ export async function prepararArca(authHeader, tenantId) {
   if (!membership) throw new Error('No tenés permiso sobre este negocio')
 
   // 2) Cliente admin (service_role) para leer config y certificado
-  const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY)
+  const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  })
 
   const { data: config, error: cfgErr } = await admin
     .from('arca_config')
