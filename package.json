@@ -9,7 +9,7 @@
     "dev": "node --env-file=.env --watch index.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": "20.x"
   },
   "dependencies": {
     "@arcasdk/core": "^0.3.5",
