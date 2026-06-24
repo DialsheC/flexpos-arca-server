@@ -3,13 +3,15 @@
 // (preapproval) de Mercado Pago. Usa fetch nativo (Node 20+), sin dependencias.
 //
 // Variables de entorno necesarias (se configuran en Railway):
-//   MP_ACCESS_TOKEN   → Access Token de PRODUCCIÓN de tu app de Mercado Pago
+//   MP_ACCESS_TOKEN   → Access Token de tu app de Mercado Pago
 //   APP_URL           → URL de la app (back_url tras el checkout). Ej: https://app.softcode.com.ar
 //   ADMIN_SECRET      → clave simple para proteger el endpoint de crear planes
 //   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY → ya existentes
 //
-// Modelo: un "preapproval_plan" por cada plan (starter/profesional/empresa),
-// cada uno con 30 días gratis y cobro mensual automático en ARS.
+// Modelo: por cada plan (starter/profesional/empresa) se crean DOS planes en MP:
+//   - mensual: cobro cada mes, 14 días gratis
+//   - anual:   cobro cada 12 meses (precio x10 = 2 meses bonificados), 1 mes gratis
+// La clave en la tabla planes_mp es `${plan}_${ciclo}` (ej: profesional_anual).
 
 import { createClient } from '@supabase/supabase-js'
 import ws from 'ws'
@@ -20,12 +22,23 @@ const APP_URL   = process.env.APP_URL || 'https://app.softcode.com.ar'
 const SUPABASE_URL = process.env.SUPABASE_URL
 const SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY
 
-// Definición de los planes del SaaS (precio mensual en ARS).
-// Ajustá los montos acá si cambian. El precio es lo que MP cobra cada mes.
+// Precio MENSUAL base de cada plan (en ARS). Ajustá acá si cambian.
 const PLANES = {
   starter:     { reason: 'FlexVentas · Plan Starter',     precio: 15000 },
   profesional: { reason: 'FlexVentas · Plan Profesional', precio: 29000 },
   empresa:     { reason: 'FlexVentas · Plan Empresa',     precio: 55000 },
+}
+
+// Ciclos de cobro. El anual cobra 10 meses (2 gratis) y da 1 mes de prueba.
+const CICLOS = {
+  mensual: {
+    frequency: 1,  frequency_type: 'months', mult: 1,
+    free_trial: { frequency: 14, frequency_type: 'days' },   // 14 días gratis
+  },
+  anual: {
+    frequency: 12, frequency_type: 'months', mult: 10,
+    free_trial: { frequency: 1,  frequency_type: 'months' }, // 1 mes gratis
+  },
 }
 
 function admin() {
@@ -53,54 +66,64 @@ async function mpFetch(path, opts = {}) {
   return data
 }
 
+// Mapea el estado de una suscripción de MP al plan_status que usa la app.
+// (la app lee 'active' | 'suspended' | 'cancelled' en getEstadoLicencia)
+function estadoApp(mpStatus) {
+  if (mpStatus === 'authorized') return 'active'
+  if (mpStatus === 'paused')     return 'suspended'
+  if (mpStatus === 'cancelled')  return 'cancelled'
+  return 'pending'
+}
+
 // ── Crear (o recrear) los planes de suscripción en Mercado Pago ──────────────
-// Se corre UNA vez (o cuando cambian los precios). Guarda los IDs e init_points
-// en la tabla planes_mp de Supabase para que la app los use.
+// Se corre UNA vez (o cuando cambian precios/trials). Crea 6 planes
+// (3 planes x 2 ciclos) y los guarda en planes_mp.
 export async function crearPlanes() {
   const db = admin()
   const resultados = []
 
   for (const [key, cfg] of Object.entries(PLANES)) {
-    // Crear el plan en MP con 30 días de prueba gratis y cobro mensual
-    const plan = await mpFetch('/preapproval_plan', {
-      method: 'POST',
-      body: JSON.stringify({
-        reason: cfg.reason,
-        auto_recurring: {
-          frequency: 1,
-          frequency_type: 'months',
-          transaction_amount: cfg.precio,
-          currency_id: 'ARS',
-          free_trial: { frequency: 30, frequency_type: 'days' },
-        },
-        payment_methods_allowed: { payment_types: [{}], payment_methods: [{}] },
-        back_url: `${APP_URL}/suscripcion-ok`,
-      }),
-    })
+    for (const [ciclo, c] of Object.entries(CICLOS)) {
+      const precio = cfg.precio * c.mult
+      const plan = await mpFetch('/preapproval_plan', {
+        method: 'POST',
+        body: JSON.stringify({
+          reason: `${cfg.reason} (${ciclo})`,
+          auto_recurring: {
+            frequency: c.frequency,
+            frequency_type: c.frequency_type,
+            transaction_amount: precio,
+            currency_id: 'ARS',
+            free_trial: c.free_trial,
+          },
+          payment_methods_allowed: { payment_types: [{}], payment_methods: [{}] },
+          back_url: `${APP_URL}/suscripcion-ok`,
+        }),
+      })
 
-    // Guardar en Supabase (upsert por plan)
-    await db.from('planes_mp').upsert({
-      plan: key,
-      preapproval_plan_id: plan.id,
-      init_point: plan.init_point,
-      precio: cfg.precio,
-      actualizado: new Date().toISOString(),
-    }, { onConflict: 'plan' })
+      const claveDb = `${key}_${ciclo}`   // ej: profesional_anual
+      await db.from('planes_mp').upsert({
+        plan: claveDb,
+        preapproval_plan_id: plan.id,
+        init_point: plan.init_point,
+        precio,
+        actualizado: new Date().toISOString(),
+      }, { onConflict: 'plan' })
 
-    resultados.push({ plan: key, id: plan.id, init_point: plan.init_point })
+      resultados.push({ plan: claveDb, id: plan.id, precio, init_point: plan.init_point })
+    }
   }
   return resultados
 }
 
 // ── Generar el link de checkout para que un tenant active su suscripción ─────
-// Devuelve el init_point del plan. El external_reference (tenant_id) se vincula
-// al volver del checkout (confirmarSuscripcion) y vía webhook.
-export async function linkSuscripcion(tenantId, planKey) {
+// planKey = starter | profesional | empresa ; ciclo = mensual | anual
+export async function linkSuscripcion(tenantId, planKey, ciclo = 'mensual') {
   const db = admin()
+  const claveDb = `${planKey}_${ciclo}`
   const { data: plan, error } = await db
-    .from('planes_mp').select('init_point, preapproval_plan_id').eq('plan', planKey).single()
-  if (error || !plan) throw new Error('Plan no configurado en Mercado Pago: ' + planKey)
-  // Pasamos el tenant en el back_url para reconocerlo al volver
+    .from('planes_mp').select('init_point, preapproval_plan_id').eq('plan', claveDb).single()
+  if (error || !plan) throw new Error('Plan no configurado en Mercado Pago: ' + claveDb)
   const back = encodeURIComponent(tenantId)
   const sep = plan.init_point.includes('?') ? '&' : '?'
   return { init_point: `${plan.init_point}${sep}ext=${back}` }
@@ -114,25 +137,23 @@ export async function confirmarSuscripcion(tenantId, preapprovalId) {
   const pre = await mpFetch('/preapproval/' + preapprovalId)
   const db = admin()
 
-  const activa = pre.status === 'authorized'
+  const estado = estadoApp(pre.status)
   await db.from('tenants').update({
     mp_preapproval_id: preapprovalId,
-    plan_status: activa ? 'active' : 'pending',
+    plan_status: estado,
   }).eq('id', tenantId)
 
-  return { ok: activa, status: pre.status }
+  return { ok: estado === 'active', status: pre.status }
 }
 
 // ── Procesar notificación del webhook de Mercado Pago ────────────────────────
 // MP avisa cada vez que cambia una suscripción o se procesa un cobro.
 // Buscamos el tenant por su preapproval_id guardado y actualizamos su estado.
 export async function procesarWebhook(body, query) {
-  // El id de la suscripción puede venir de distintas formas según el evento
   const tipo = body?.type || query?.type || query?.topic
   const id = body?.data?.id || query?.id || query['data.id']
   if (!id) return { ok: true, ignored: 'sin id' }
 
-  // Solo nos interesan eventos de suscripción
   if (tipo && !String(tipo).includes('preapproval') && !String(tipo).includes('subscription')) {
     return { ok: true, ignored: tipo }
   }
@@ -142,16 +163,12 @@ export async function procesarWebhook(body, query) {
   catch (e) { return { ok: true, ignored: 'no es preapproval: ' + e.message } }
 
   const db = admin()
-  const nuevoEstado =
-    pre.status === 'authorized' ? 'active' :
-    pre.status === 'paused'     ? 'suspendida' :
-    pre.status === 'cancelled'  ? 'cancelada' : 'pending'
+  const estado = estadoApp(pre.status)
 
-  // Actualizar el tenant que tenga esta suscripción
   const { data: t } = await db.from('tenants')
-    .update({ plan_status: nuevoEstado })
+    .update({ plan_status: estado })
     .eq('mp_preapproval_id', id)
     .select('id').maybeSingle()
 
-  return { ok: true, preapproval: id, estado: nuevoEstado, tenant: t?.id || null }
+  return { ok: true, preapproval: id, estado, tenant: t?.id || null }
 }
