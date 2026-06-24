@@ -8,6 +8,7 @@
 import express from 'express'
 import cors from 'cors'
 import { prepararArca } from './src/arca.js'
+import { crearPlanes, linkSuscripcion, confirmarSuscripcion, procesarWebhook } from './src/mercadopago.js'
 
 const app = express()
 app.use(cors())                       // permite llamadas desde la app web
@@ -182,6 +183,60 @@ app.post('/emitir', async (req, res) => {
     res.status(500).json({ ok: false, error: e?.message || String(e) })
   }
 })
+
+// ════════════════════════════════════════════════════════════════════════════
+// MERCADO PAGO — Suscripciones
+// ════════════════════════════════════════════════════════════════════════════
+
+// POST /mp/crear-planes — crea los planes en MP (correr una vez). Protegido.
+app.post('/mp/crear-planes', async (req, res) => {
+  try {
+    if (req.headers['x-admin-secret'] !== process.env.ADMIN_SECRET) {
+      return res.status(401).json({ ok: false, error: 'No autorizado' })
+    }
+    const planes = await crearPlanes()
+    res.json({ ok: true, planes })
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) })
+  }
+})
+
+// POST /mp/suscribir — devuelve el link de checkout para un tenant + plan
+app.post('/mp/suscribir', async (req, res) => {
+  try {
+    const { tenant_id, plan } = req.body
+    if (!tenant_id || !plan) return res.status(400).json({ ok: false, error: 'Faltan tenant_id y plan' })
+    const r = await linkSuscripcion(tenant_id, plan)
+    res.json({ ok: true, ...r })
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) })
+  }
+})
+
+// POST /mp/confirmar — al volver del checkout, verifica y activa la suscripción
+app.post('/mp/confirmar', async (req, res) => {
+  try {
+    const { tenant_id, preapproval_id } = req.body
+    const r = await confirmarSuscripcion(tenant_id, preapproval_id)
+    res.json(r)
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) })
+  }
+})
+
+// POST/GET /mp/webhook — notificaciones de Mercado Pago (cobros, cambios de estado)
+async function webhookHandler(req, res) {
+  try {
+    const r = await procesarWebhook(req.body || {}, req.query || {})
+    res.status(200).json(r)   // MP espera 200 siempre
+  } catch (e) {
+    // Aun ante error respondemos 200 para que MP no reintente infinito; logueamos
+    console.error('webhook MP:', e?.message || e)
+    res.status(200).json({ ok: false })
+  }
+}
+app.post('/mp/webhook', webhookHandler)
+app.get('/mp/webhook', webhookHandler)
 
 const PORT = process.env.PORT || 8080
 app.listen(PORT, () => console.log(`FlexPOS ARCA server escuchando en :${PORT}`))
