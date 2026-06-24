@@ -138,11 +138,15 @@ export async function confirmarSuscripcion(tenantId, preapprovalId) {
   const db = admin()
 
   const estado = estadoApp(pre.status)
-  await db.from('tenants').update({
-    mp_preapproval_id: preapprovalId,
-    plan_status: estado,
-  }).eq('id', tenantId)
+  const cambios = { mp_preapproval_id: preapprovalId, plan_status: estado }
 
+  // Si quedó activa, promover del trial al plan que el cliente eligió
+  if (estado === 'active') {
+    const { data: t } = await db.from('tenants').select('plan_elegido').eq('id', tenantId).maybeSingle()
+    if (t?.plan_elegido) cambios.plan = t.plan_elegido
+  }
+
+  await db.from('tenants').update(cambios).eq('id', tenantId)
   return { ok: estado === 'active', status: pre.status }
 }
 
@@ -165,10 +169,16 @@ export async function procesarWebhook(body, query) {
   const db = admin()
   const estado = estadoApp(pre.status)
 
+  // Buscar el tenant de esta suscripción
   const { data: t } = await db.from('tenants')
-    .update({ plan_status: estado })
-    .eq('mp_preapproval_id', id)
-    .select('id').maybeSingle()
+    .select('id, plan_elegido').eq('mp_preapproval_id', id).maybeSingle()
+
+  if (t) {
+    const cambios = { plan_status: estado }
+    // Si quedó activa, promover del trial al plan elegido
+    if (estado === 'active' && t.plan_elegido) cambios.plan = t.plan_elegido
+    await db.from('tenants').update(cambios).eq('id', t.id)
+  }
 
   return { ok: true, preapproval: id, estado, tenant: t?.id || null }
 }
