@@ -137,6 +137,11 @@ export async function crearPlanes() {
 export async function linkSuscripcion(tenantId, planKey, ciclo = 'mensual', codigo = null) {
   const db = admin()
 
+  // Guardar el plan que el cliente ELIGIÓ en el checkout. Sin esto, al confirmar el
+  // pago se promovía al plan_elegido viejo (el del registro), y el plan real que
+  // eligió acá se perdía (ej: elegía Starter y quedaba Profesional).
+  await db.from('tenants').update({ plan_elegido: planKey }).eq('id', tenantId)
+
   // ── CON CÓDIGO PROMO: preapproval individual con precio custom ──
   if (codigo) {
     const promo = await validarCodigo(db, codigo, planKey)
@@ -280,6 +285,75 @@ export async function cancelarSuscripcion(tenantId, preapprovalId, userToken) {
   // Marcar el negocio como cancelado
   await db.from('tenants').update({ plan_status: 'cancelled' }).eq('id', tenantId)
   return { ok: true }
+}
+
+// ── ADMIN: ver y gestionar suscripciones de todos los clientes ───────────────
+// Protegido: sólo usuarios con profiles.rol = 'admin' (verificado por el token).
+async function verificarAdmin(token) {
+  if (!token) throw new Error('No autorizado')
+  const db = admin()
+  const { data: ures } = await db.auth.getUser(token)
+  const uid = ures?.user?.id
+  if (!uid) throw new Error('No autorizado')
+  const { data: perfil } = await db.from('profiles').select('rol').eq('id', uid).maybeSingle()
+  if (perfil?.rol !== 'admin') throw new Error('Solo administradores')
+  return { db, uid }
+}
+
+const NOMBRE_PLAN = { starter: 'Starter', profesional: 'Profesional', empresa: 'Empresa', trial: 'Prueba' }
+
+// Lista las suscripciones cruzando cada tenant con su preapproval real en MP.
+export async function listarSuscripcionesAdmin(token) {
+  const { db } = await verificarAdmin(token)
+  const { data: tenants } = await db.from('tenants')
+    .select('id, nombre_negocio, owner_id, plan, plan_elegido, plan_status, mp_preapproval_id, created_at')
+    .not('mp_preapproval_id', 'is', null)
+    .order('created_at', { ascending: false })
+
+  const out = []
+  for (const t of (tenants || [])) {
+    let mp = null, mpErr = null
+    try { mp = await mpFetch('/preapproval/' + t.mp_preapproval_id) }
+    catch (e) { mpErr = e.message }
+
+    let email = null
+    try { const { data: u } = await db.auth.admin.getUserById(t.owner_id); email = u?.user?.email || null } catch {}
+
+    out.push({
+      tenant_id: t.id,
+      negocio: t.nombre_negocio || 'Sin nombre',
+      email,
+      plan: NOMBRE_PLAN[t.plan] || t.plan || '—',
+      plan_status: t.plan_status,
+      preapproval_id: t.mp_preapproval_id,
+      mp_status: mp?.status || null,
+      monto: mp?.auto_recurring?.transaction_amount ?? null,
+      moneda: mp?.auto_recurring?.currency_id || 'ARS',
+      frecuencia: mp?.auto_recurring ? `cada ${mp.auto_recurring.frequency} ${mp.auto_recurring.frequency_type}` : null,
+      proximo_cobro: mp?.next_payment_date || null,
+      creada: mp?.date_created || t.created_at,
+      error: mpErr,
+    })
+  }
+  return { ok: true, suscripciones: out }
+}
+
+// Acción admin sobre una suscripción: cancelar | pausar | reactivar.
+export async function gestionarSuscripcionAdmin(token, preapprovalId, accion) {
+  const { db } = await verificarAdmin(token)
+  if (!preapprovalId) throw new Error('Falta la suscripción')
+  const mapa = { cancelar: 'cancelled', pausar: 'paused', reactivar: 'authorized' }
+  const nuevo = mapa[accion]
+  if (!nuevo) throw new Error('Acción inválida')
+
+  await mpFetch('/preapproval/' + preapprovalId, {
+    method: 'PUT',
+    body: JSON.stringify({ status: nuevo }),
+  })
+
+  const appStatus = nuevo === 'cancelled' ? 'cancelled' : nuevo === 'paused' ? 'suspended' : 'active'
+  await db.from('tenants').update({ plan_status: appStatus }).eq('mp_preapproval_id', preapprovalId)
+  return { ok: true, status: nuevo }
 }
 
 // ── Procesar notificación del webhook de Mercado Pago ────────────────────────
